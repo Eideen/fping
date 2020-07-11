@@ -34,18 +34,20 @@
 extern "C" {
 #endif /* __cplusplus */
 
+#include "config.h"
 #include "fping.h"
 #include "options.h"
 #include "optparse.h"
 
+#include <inttypes.h>
 #include <errno.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <time.h>
 #include <limits.h>
 
-#include "config.h"
 #include "seqmap.h"
 
 #ifdef HAVE_UNISTD_H
@@ -58,6 +60,8 @@ extern "C" {
 
 #include <stddef.h>
 #include <string.h>
+
+#include <time.h>
 
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -81,6 +85,17 @@ extern "C" {
 
 #include <sys/select.h>
 
+/*** compatibility ***/
+
+/* Mac OS X's getaddrinfo() does not fail if we use an invalid combination,
+ * e.g. AF_INET6 with "127.0.0.1". If we pass AI_UNUSABLE to flags, it behaves
+ * like other platforms. But AI_UNUSABLE isn't available on other platforms,
+ * and we can safely use 0 for flags instead.
+ */
+#ifndef AI_UNUSABLE
+#define AI_UNUSABLE 0
+#endif
+
 /*** externals ***/
 
 extern char* optarg;
@@ -96,6 +111,18 @@ extern int h_errno;
 /*** Constants ***/
 
 #define EMAIL "david@schweikert.ch"
+
+#if HAVE_SO_TIMESTAMPNS
+#define CLOCKID CLOCK_REALTIME
+#endif
+
+#if !defined(CLOCKID)
+#if defined(CLOCK_MONOTONIC)
+#define CLOCKID CLOCK_MONOTONIC
+#else
+#define CLOCKID CLOCK_REALTIME
+#endif
+#endif
 
 /*** Ping packet defines ***/
 
@@ -188,7 +215,7 @@ typedef struct host_entry {
       * to be sent, or the timeout, if the last ping was sent */
     struct host_entry* ev_prev; /* double linked list for the event-queue */
     struct host_entry* ev_next; /* double linked list for the event-queue */
-    struct timeval ev_time; /* time, after which this event should happen */
+    struct timespec ev_time; /* time, after which this event should happen */
     int ev_type; /* event type */
 
     int i; /* index into array */
@@ -200,7 +227,7 @@ typedef struct host_entry {
     int timeout; /* time to wait for response */
     unsigned char running; /* unset when through sending */
     unsigned char waiting; /* waiting for response */
-    struct timeval last_send_time; /* time of last packet sent */
+    struct timespec last_send_time; /* time of last packet sent */
     int num_sent; /* number of ping packets sent */
     int num_recv; /* number of pings received (duplicates ignored) */
     int num_recv_total; /* number of pings received, including duplicates */
@@ -214,11 +241,13 @@ typedef struct host_entry {
     int min_reply_i; /* shortest response time */
     int total_time_i; /* sum of response times */
     int discard_next_recv_i; /* don't count next received reply for split reporting */
-    int* resp_times; /* individual response times */
+
     int* window; /* circular buffer of per-sent-ping timestamps for pings within their timeouts */
     int window_size; /* size of above; needs to be larger than ceil(timeout / period) */
+
+    int64_t* resp_times; /* individual response times */
 #if defined(DEBUG) || defined(_DEBUG)
-    int* sent_times; /* per-sent-ping timestamp */
+    int64_t* sent_times; /* per-sent-ping timestamp */
 #endif /* DEBUG || _DEBUG */
 } HOST_ENTRY;
 
@@ -233,14 +262,18 @@ HOST_ENTRY* ev_first;
 HOST_ENTRY* ev_last;
 
 char* prog;
-int ident; /* our pid */
+int ident4 = 0; /* our icmp identity field */
 int socket4 = -1;
+int using_sock_dgram4 = 0;
 #ifndef IPV6
 int hints_ai_family = AF_INET;
 #else
+int ident6 = 0;
 int socket6 = -1;
 int hints_ai_family = AF_UNSPEC;
 #endif
+
+volatile sig_atomic_t status_snapshot = 0;
 
 unsigned int debugging = 0;
 
@@ -278,12 +311,11 @@ int num_timeout = 0, /* number of times select timed out */
     num_pingreceived = 0, /* total pings received */
     num_othericmprcvd = 0; /* total non-echo-reply ICMP received */
 
-struct timeval current_time; /* current time (pseudo) */
-struct timeval start_time;
-struct timeval end_time;
-struct timeval last_send_time; /* time last ping was sent */
-struct timeval next_report_time; /* time next -Q report is expected */
-struct timezone tz;
+struct timespec current_time; /* current time (pseudo) */
+struct timespec start_time;
+struct timespec end_time;
+struct timespec last_send_time; /* time last ping was sent */
+struct timespec next_report_time; /* time next -Q report is expected */
 
 /* switches */
 int generate_flag = 0; /* flag for IP list generation */
@@ -311,8 +343,11 @@ void errno_crash_and_burn(char* message);
 char* get_host_by_address(struct in_addr in);
 void remove_job(HOST_ENTRY* h);
 int send_ping(HOST_ENTRY* h);
-long timeval_diff(struct timeval* a, struct timeval* b);
-void timeval_add(struct timeval* a, long t_10u);
+void timespec_from_ns(struct timespec* a, uint64_t ns);
+int64_t timespec_ns(struct timespec* a);
+int64_t timespec_diff(struct timespec* a, struct timespec* b);
+long timespec_diff_10us(struct timespec* a, struct timespec* b);
+void timespec_add_10us(struct timespec* a, long t_10u);
 void usage(int);
 int wait_for_reply(long);
 void print_per_system_stats(void);
@@ -320,8 +355,9 @@ void print_per_system_splits(void);
 void print_netdata(void);
 void print_global_stats(void);
 void main_loop();
+void sigstatus();
 void finish();
-char* sprint_tm(int t);
+const char* sprint_tm(int64_t t);
 void ev_enqueue(HOST_ENTRY* h);
 HOST_ENTRY* ev_dequeue();
 void ev_remove(HOST_ENTRY* h);
@@ -331,6 +367,19 @@ void print_warning(char* fmt, ...);
 int addr_cmp(struct sockaddr* a, struct sockaddr* b);
 
 /*** function definitions ***/
+
+static inline void copy_timespec(struct timespec *dst, const struct timespec *src)
+{
+    dst->tv_sec = src->tv_sec;
+    dst->tv_nsec = src->tv_nsec;
+}
+
+static inline long ns_to_tick(int64_t ns)
+{
+    ns /= 1000; // ns -> us
+    ns /= 10;   // us -> 10us ticks
+    return (long)ns;
+}
 
 /************************************************************
 
@@ -362,14 +411,19 @@ int main(int argc, char** argv)
         usage(0);
     }
 
-    socket4 = open_ping_socket_ipv4(ping_data_size);
+    socket4 = open_ping_socket_ipv4(&using_sock_dgram4);
 #ifdef IPV6
-    socket6 = open_ping_socket_ipv6(ping_data_size);
+    socket6 = open_ping_socket_ipv6();
     /* if called (sym-linked) via 'fping6', imply '-6'
      * for backward compatibility */
     if (strstr(prog, "fping6")) {
         hints_ai_family = AF_INET6;
     }
+#endif
+
+    memset(&src_addr, 0, sizeof(src_addr));
+#ifdef IPV6
+    memset(&src_addr6, 0, sizeof(src_addr6));
 #endif
 
     if ((uid = getuid())) {
@@ -379,7 +433,7 @@ int main(int argc, char** argv)
     }
 
     optparse_init(&optparse_state, argv);
-    ident = getpid() & 0xFFFF;
+    ident4 = ident6 = getpid() & 0xFFFF;
     verbose_flag = 1;
     backoff_flag = 1;
     opterr = 1;
@@ -423,6 +477,9 @@ int main(int argc, char** argv)
         { "unreach", 'u', OPTPARSE_NONE },
         { "version", 'v', OPTPARSE_NONE },
         { "reachable", 'x', OPTPARSE_REQUIRED },
+#if defined(DEBUG) || defined(_DEBUG)
+        { NULL, 'z', OPTPARSE_REQUIRED },
+#endif
         { 0, 0, 0 }
     };
 
@@ -430,11 +487,13 @@ int main(int argc, char** argv)
     while ((c = optparse_long(&optparse_state, longopts, NULL)) != EOF) {
         switch (c) {
         case '4':
+#ifdef IPV6
             if (hints_ai_family != AF_UNSPEC) {
                 fprintf(stderr, "%s: can't specify both -4 and -6\n", prog);
                 exit(1);
             }
             hints_ai_family = AF_INET;
+#endif
             break;
         case '6':
 #ifdef IPV6
@@ -610,14 +669,15 @@ int main(int argc, char** argv)
             break;
 
         case 'H':
-            if (!(ttl = (u_int)atoi(optparse_state.optarg)))
+            if (!(ttl = (unsigned int)atoi(optparse_state.optarg)))
                 usage(1);
             break;
 
 #if defined(DEBUG) || defined(_DEBUG)
         case 'z':
-            if (!(debugging = (unsigned int)atoi(optparse_state.optarg)))
-                usage(1);
+            if (sscanf(optparse_state.optarg, "0x%x", &debugging) != 1)
+                if (sscanf(optparse_state.optarg, "%u", &debugging) != 1)
+                    usage(1);
 
             break;
 #endif /* DEBUG || _DEBUG */
@@ -629,7 +689,7 @@ int main(int argc, char** argv)
 
         case 'x':
             if (!(min_reachable = (unsigned int)atoi(optparse_state.optarg)))
-                usage(1); 
+                usage(1);
             break;
 
         case 'f':
@@ -661,12 +721,14 @@ int main(int argc, char** argv)
             if (socket4 >= 0) {
                 if (setsockopt(socket4, SOL_SOCKET, SO_BINDTODEVICE, optparse_state.optarg, strlen(optparse_state.optarg))) {
                     perror("binding to specific interface (SO_BINTODEVICE)");
+                    exit(1);
                 }
             }
 #ifdef IPV6
             if (socket6 >= 0) {
                 if (setsockopt(socket6, SOL_SOCKET, SO_BINDTODEVICE, optparse_state.optarg, strlen(optparse_state.optarg))) {
                     perror("binding to specific interface (SO_BINTODEVICE), IPV6");
+                    exit(1);
                 }
             }
 #endif
@@ -878,18 +940,18 @@ int main(int argc, char** argv)
 #endif
     }
 
-#if HAVE_SO_TIMESTAMP
+#if HAVE_SO_TIMESTAMPNS
     {
         int opt = 1;
         if (socket4 >= 0) {
-            if (setsockopt(socket4, SOL_SOCKET, SO_TIMESTAMP, &opt, sizeof(opt))) {
-                perror("setting SO_TIMESTAMP option");
+            if (setsockopt(socket4, SOL_SOCKET, SO_TIMESTAMPNS, &opt, sizeof(opt))) {
+                perror("setting SO_TIMESTAMPNS option");
             }
         }
 #ifdef IPV6
         if (socket6 >= 0) {
-            if (setsockopt(socket6, SOL_SOCKET, SO_TIMESTAMP, &opt, sizeof(opt))) {
-                perror("setting SO_TIMESTAMP option (IPv6)");
+            if (setsockopt(socket6, SOL_SOCKET, SO_TIMESTAMPNS, &opt, sizeof(opt))) {
+                perror("setting SO_TIMESTAMPNS option (IPv6)");
             }
         }
 #endif
@@ -965,12 +1027,12 @@ int main(int argc, char** argv)
         exit(num_noaddress ? 2 : 1);
     }
 
-    if (src_addr_set && socket4 >= 0) {
-        socket_set_src_addr_ipv4(socket4, &src_addr);
+    if (socket4 >= 0) {
+        socket_set_src_addr_ipv4(socket4, &src_addr, &ident4);
     }
 #ifdef IPV6
-    if (src_addr6_set && socket6 >= 0) {
-        socket_set_src_addr_ipv6(socket6, &src_addr6);
+    if (socket6 >= 0) {
+        socket_set_src_addr_ipv6(socket6, &src_addr6, &ident6);
     }
 #endif
 
@@ -1009,20 +1071,22 @@ int main(int argc, char** argv)
 #endif
 
     signal(SIGINT, finish);
+    signal(SIGQUIT, sigstatus);
+    setlinebuf(stdout);
 
-    gettimeofday(&start_time, &tz);
+    clock_gettime(CLOCKID, &start_time);
     current_time = start_time;
 
     if (report_interval) {
         next_report_time = start_time;
-        timeval_add(&next_report_time, report_interval);
+        timespec_add_10us(&next_report_time, report_interval);
     }
 
     last_send_time.tv_sec = current_time.tv_sec - 10000;
 
 #if defined(DEBUG) || defined(_DEBUG)
     if (randomly_lose_flag)
-        srandom(start_time.tv_usec);
+        srandom(start_time.tv_nsec);
 #endif /* DEBUG || _DEBUG */
 
     seqmap_init();
@@ -1167,11 +1231,11 @@ void main_loop()
 
     while (ev_first) {
         /* Any event that can be processed now ? */
-        if (ev_first->ev_time.tv_sec < current_time.tv_sec || (ev_first->ev_time.tv_sec == current_time.tv_sec && ev_first->ev_time.tv_usec < current_time.tv_usec)) {
+        if (timespec_diff_10us(&ev_first->ev_time, &current_time) < 0) {
             /* Event type: ping */
             if (ev_first->ev_type == EV_TYPE_PING) {
                 /* Make sure that we don't ping more than once every "interval" */
-                lt = timeval_diff(&current_time, &last_send_time);
+                lt = timespec_diff_10us(&current_time, &last_send_time);
                 if (lt < interval)
                     goto wait_for_reply;
 
@@ -1186,9 +1250,8 @@ void main_loop()
                     /* Normal mode: schedule retry */
                     if (h->waiting < retry + 1) {
                         h->ev_type = EV_TYPE_PING;
-                        h->ev_time.tv_sec = last_send_time.tv_sec;
-                        h->ev_time.tv_usec = last_send_time.tv_usec;
-                        timeval_add(&h->ev_time, h->timeout);
+                        copy_timespec(&h->ev_time, &last_send_time);
+                        timespec_add_10us(&h->ev_time, h->timeout);
                         ev_enqueue(h);
 
                         if (backoff_flag) {
@@ -1198,26 +1261,23 @@ void main_loop()
                     /* Normal mode: schedule timeout for last retry */
                     else {
                         h->ev_type = EV_TYPE_TIMEOUT;
-                        h->ev_time.tv_sec = last_send_time.tv_sec;
-                        h->ev_time.tv_usec = last_send_time.tv_usec;
-                        timeval_add(&h->ev_time, h->timeout);
+                        copy_timespec(&h->ev_time, &last_send_time);
+                        timespec_add_10us(&h->ev_time, h->timeout);
                         ev_enqueue(h);
                     }
                 }
                 /* Loop and count mode: schedule next ping */
                 else if (loop_flag || (count_flag && h->num_sent < count)) {
                     h->ev_type = EV_TYPE_PING;
-                    h->ev_time.tv_sec = last_send_time.tv_sec;
-                    h->ev_time.tv_usec = last_send_time.tv_usec;
-                    timeval_add(&h->ev_time, perhost_interval);
+                    copy_timespec(&h->ev_time, &last_send_time);
+                    timespec_add_10us(&h->ev_time, perhost_interval);
                     ev_enqueue(h);
                 }
                 /* Count mode: schedule timeout after last ping */
                 else if (count_flag && h->num_sent >= count) {
                     h->ev_type = EV_TYPE_TIMEOUT;
-                    h->ev_time.tv_sec = last_send_time.tv_sec;
-                    h->ev_time.tv_usec = last_send_time.tv_usec;
-                    timeval_add(&h->ev_time, h->timeout);
+                    copy_timespec(&h->ev_time, &last_send_time);
+                    timespec_add_10us(&h->ev_time, h->timeout);
                     ev_enqueue(h);
                 }
             }
@@ -1236,7 +1296,7 @@ void main_loop()
                 wait_time = 0;
             }
             else {
-                wait_time = timeval_diff(&ev_first->ev_time, &current_time);
+                wait_time = timespec_diff_10us(&ev_first->ev_time, &current_time);
                 if (wait_time < 0)
                     wait_time = 0;
             }
@@ -1244,7 +1304,7 @@ void main_loop()
                 /* make sure that we wait enough, so that the inter-ping delay is
                  * bigger than 'interval' */
                 if (wait_time < interval) {
-                    lt = timeval_diff(&current_time, &last_send_time);
+                    lt = timespec_diff_10us(&current_time, &last_send_time);
                     if (lt < interval) {
                         wait_time = interval - lt;
                     }
@@ -1256,7 +1316,7 @@ void main_loop()
 
 #if defined(DEBUG) || defined(_DEBUG)
             if (trace_flag) {
-                fprintf(stderr, "next event in %d ms (%s)\n", wait_time / 100, ev_first->host);
+                fprintf(stderr, "next event in %ld ms (%s)\n", wait_time / 100, ev_first->host);
             }
 #endif
         }
@@ -1266,7 +1326,7 @@ void main_loop()
 
         /* Make sure we don't wait too long, in case a report is expected */
         if (report_interval && (loop_flag || count_flag)) {
-            wait_time_next_report = timeval_diff(&next_report_time, &current_time);
+            wait_time_next_report = timespec_diff_10us(&next_report_time, &current_time);
             if (wait_time_next_report < wait_time) {
                 wait_time = wait_time_next_report;
                 if (wait_time < 0) {
@@ -1282,20 +1342,45 @@ void main_loop()
                 ; /* process other replies in the queue */
         }
 
-        gettimeofday(&current_time, &tz);
+        clock_gettime(CLOCKID, &current_time);
+
+        if (status_snapshot) {
+            status_snapshot = 0;
+            print_per_system_splits();
+        }
 
         /* Print report */
-        if (report_interval && (loop_flag || count_flag) && (timeval_diff(&current_time, &next_report_time) >= 0)) {
+        if (report_interval && (loop_flag || count_flag) && (timespec_diff_10us(&current_time, &next_report_time) >= 0)) {
             if (netdata_flag)
                 print_netdata();
             else
                 print_per_system_splits();
 
-            while (timeval_diff(&current_time, &next_report_time) >= 0)
-                timeval_add(&next_report_time, report_interval);
+            while (timespec_diff_10us(&current_time, &next_report_time) >= 0)
+                timespec_add_10us(&next_report_time, report_interval);
         }
     }
 }
+
+/************************************************************
+
+  Function: sigstatus
+
+*************************************************************
+
+  Inputs:  void (none)
+
+  Description:
+
+  SIGQUIT signal handler - set flag and return
+
+************************************************************/
+
+void sigstatus()
+{
+    status_snapshot = 1;
+}
+
 
 /************************************************************
 
@@ -1316,7 +1401,7 @@ void finish()
     int i;
     HOST_ENTRY* h;
 
-    gettimeofday(&end_time, &tz);
+    clock_gettime(CLOCKID, &end_time);
 
     /* tot up unreachables */
     for (i = 0; i < num_hosts; i++) {
@@ -1381,9 +1466,7 @@ void print_per_system_stats(void)
 {
     int i, j, avg, outage_ms;
     HOST_ENTRY* h;
-    int resp;
-
-    fflush(stdout);
+    int64_t resp;
 
     if (verbose_flag || per_recv_flag)
         fprintf(stderr, "\n");
@@ -1395,7 +1478,7 @@ void print_per_system_stats(void)
         if (report_all_rtts_flag) {
             for (j = 0; j < h->num_sent; j++) {
                 if ((resp = h->resp_times[j]) >= 0)
-                    fprintf(stderr, " %d.%02d", resp / 100, resp % 100);
+                    fprintf(stderr, " %s", sprint_tm(resp));
                 else
                     fprintf(stderr, " -");
             }
@@ -1464,10 +1547,17 @@ void print_netdata(void)
     int i, avg;
     HOST_ENTRY* h;
 
-    fflush(stdout);
-
     for (i = 0; i < num_hosts; i++) {
         h = table[i];
+
+        /* if we just sent the probe and didn't receive a reply, we shouldn't count it */
+        h->discard_next_recv_i = 0;
+        if (h->waiting && timespec_diff_10us(&current_time, &h->last_send_time) < h->timeout) {
+            if (h->num_sent_i) {
+                h->num_sent_i--;
+                h->discard_next_recv_i = 1;
+            }
+        }
 
         if (!sent_charts) {
             printf("CHART fping.%s_packets '' 'FPing Packets for host %s' packets '%s' fping.packets line 110020 %d\n", h->name, h->host, h->name, report_interval / 100000);
@@ -1486,15 +1576,6 @@ void print_netdata(void)
             /* printf("DIMENSION lost '' absolute 1 1\n"); */
         }
 
-        /* if we just sent the probe and didn't receive a reply, we shouldn't count it */
-        h->discard_next_recv_i = 0;
-        if (h->waiting && timeval_diff(&current_time, &h->last_send_time) < h->timeout) {
-            if (h->num_sent_i) {
-                h->num_sent_i--;
-                h->discard_next_recv_i = 1;
-            }
-        }
-
         printf("BEGIN fping.%s_quality\n", h->name);
         /*
         if( h->num_recv_i <= h->num_sent_i )
@@ -1508,9 +1589,9 @@ void print_netdata(void)
 
         if (!sent_charts) {
             printf("CHART fping.%s_latency '' 'FPing Latency for host %s' ms '%s' fping.latency area 110000 %d\n", h->name, h->host, h->name, report_interval / 100000);
-            printf("DIMENSION min minimum absolute 10 1000\n");
-            printf("DIMENSION max maximum absolute 10 1000\n");
-            printf("DIMENSION avg average absolute 10 1000\n");
+            printf("DIMENSION min minimum absolute 1 1000000\n");
+            printf("DIMENSION max maximum absolute 1 1000000\n");
+            printf("DIMENSION avg average absolute 1 1000000\n");
         }
 
         printf("BEGIN fping.%s_latency\n", h->name);
@@ -1547,12 +1628,10 @@ void print_per_system_splits(void)
     HOST_ENTRY* h;
     struct tm* curr_tm;
 
-    fflush(stdout);
-
     if (verbose_flag || per_recv_flag)
         fprintf(stderr, "\n");
 
-    gettimeofday(&current_time, &tz);
+    clock_gettime(CLOCKID, &current_time);
     curr_tm = localtime((time_t*)&current_time.tv_sec);
     fprintf(stderr, "[%2.2d:%2.2d:%2.2d]\n", curr_tm->tm_hour,
         curr_tm->tm_min, curr_tm->tm_sec);
@@ -1563,7 +1642,7 @@ void print_per_system_splits(void)
 
         /* if we just sent the probe and didn't receive a reply, we shouldn't count it */
         h->discard_next_recv_i = 0;
-        if (h->waiting && timeval_diff(&current_time, &h->last_send_time) < h->timeout) {
+        if (h->waiting && timespec_diff_10us(&current_time, &h->last_send_time) < h->timeout) {
             if (h->num_sent_i) {
                 h->num_sent_i--;
                 h->discard_next_recv_i = 1;
@@ -1612,7 +1691,6 @@ void print_per_system_splits(void)
 
 void print_global_stats(void)
 {
-    fflush(stdout);
     fprintf(stderr, "\n");
     fprintf(stderr, " %7d targets\n", num_hosts);
     fprintf(stderr, " %7d alive\n", num_alive);
@@ -1637,7 +1715,7 @@ void print_global_stats(void)
         sprint_tm((int)(sum_replies / total_replies)));
     fprintf(stderr, " %s ms (max round trip time)\n", sprint_tm(max_reply));
     fprintf(stderr, " %12.3f sec (elapsed real time)\n",
-        timeval_diff(&end_time, &start_time) / 100000.0);
+        timespec_diff(&end_time, &start_time) / 1e9);
     fprintf(stderr, "\n");
 }
 
@@ -1665,7 +1743,7 @@ int send_ping(HOST_ENTRY* h)
     int myseq;
     int ret = 1;
 
-    gettimeofday(&h->last_send_time, &tz);
+    clock_gettime(CLOCKID, &h->last_send_time);
     myseq = seqmap_add(h->i, h->num_sent, &h->last_send_time);
 
 #if defined(DEBUG) || defined(_DEBUG)
@@ -1674,11 +1752,11 @@ int send_ping(HOST_ENTRY* h)
 #endif /* DEBUG || _DEBUG */
 
     if (h->saddr.ss_family == AF_INET && socket4 >= 0) {
-        n = socket_sendto_ping_ipv4(socket4, (struct sockaddr*)&h->saddr, h->saddr_len, myseq, ident);
+        n = socket_sendto_ping_ipv4(socket4, (struct sockaddr*)&h->saddr, h->saddr_len, myseq, ident4);
     }
 #ifdef IPV6
     else if (h->saddr.ss_family == AF_INET6 && socket6 >= 0) {
-        n = socket_sendto_ping_ipv6(socket6, (struct sockaddr*)&h->saddr, h->saddr_len, myseq, ident);
+        n = socket_sendto_ping_ipv6(socket6, (struct sockaddr*)&h->saddr, h->saddr_len, myseq, ident6);
     }
 #endif
     else {
@@ -1710,7 +1788,7 @@ int send_ping(HOST_ENTRY* h)
 
 #if defined(DEBUG) || defined(_DEBUG)
         if (sent_times_flag)
-            h->sent_times[h->num_sent] = timeval_diff(&h->last_send_time, &start_time);
+            h->sent_times[h->num_sent] = timespec_diff(&h->last_send_time, &start_time);
 #endif
     }
 
@@ -1727,7 +1805,7 @@ int send_ping(HOST_ENTRY* h)
 int socket_can_read(struct timeval* timeout)
 {
     int nfound;
-    fd_set readset, writeset;
+    fd_set readset;
     int socketmax;
 
 #ifndef IPV6
@@ -1738,13 +1816,12 @@ int socket_can_read(struct timeval* timeout)
 
 select_again:
     FD_ZERO(&readset);
-    FD_ZERO(&writeset);
     if(socket4 >= 0) FD_SET(socket4, &readset);
 #ifdef IPV6
     if(socket6 >= 0) FD_SET(socket6, &readset);
 #endif
 
-    nfound = select(socketmax + 1, &readset, &writeset, NULL, timeout);
+    nfound = select(socketmax + 1, &readset, NULL, NULL, timeout);
     if (nfound < 0) {
         if (errno == EINTR) {
             /* interrupted system call: redo the select */
@@ -1770,7 +1847,7 @@ select_again:
 }
 
 int receive_packet(int socket,
-    struct timeval* reply_timestamp,
+    struct timespec* reply_timestamp,
     struct sockaddr* reply_src_addr,
     size_t reply_src_addr_len,
     char* reply_buf,
@@ -1792,19 +1869,21 @@ int receive_packet(int socket,
         0
     };
     int timestamp_set = 0;
+#if HAVE_SO_TIMESTAMPNS
     struct cmsghdr* cmsg;
+#endif
 
     recv_len = recvmsg(socket, &recv_msghdr, 0);
     if (recv_len <= 0) {
         return 0;
     }
 
-#if HAVE_SO_TIMESTAMP
+#if HAVE_SO_TIMESTAMPNS
     /* ancilliary data */
     for (cmsg = CMSG_FIRSTHDR(&recv_msghdr);
          cmsg != NULL;
          cmsg = CMSG_NXTHDR(&recv_msghdr, cmsg)) {
-        if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_TIMESTAMP) {
+        if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_TIMESTAMPNS) {
             memcpy(reply_timestamp, CMSG_DATA(cmsg), sizeof(*reply_timestamp));
             timestamp_set = 1;
         }
@@ -1812,7 +1891,7 @@ int receive_packet(int socket,
 #endif
 
     if (!timestamp_set) {
-        gettimeofday(reply_timestamp, NULL);
+        clock_gettime(CLOCKID, reply_timestamp);
     }
 
 #if defined(DEBUG) || defined(_DEBUG)
@@ -1833,19 +1912,22 @@ int decode_icmp_ipv4(
     unsigned short* id,
     unsigned short* seq)
 {
-    struct ip* ip = (struct ip*)reply_buf;
     struct icmp* icp;
     int hlen = 0;
 
+    if (!using_sock_dgram4) {
+        struct ip* ip = (struct ip*)reply_buf;
+
 #if defined(__alpha__) && __STDC__ && !defined(__GLIBC__)
-    /* The alpha headers are decidedly broken.
-     * Using an ANSI compiler, it provides ip_vhl instead of ip_hl and
-     * ip_v.  So, to get ip_hl, we mask off the bottom four bits.
-     */
-    hlen = (ip->ip_vhl & 0x0F) << 2;
+        /* The alpha headers are decidedly broken.
+         * Using an ANSI compiler, it provides ip_vhl instead of ip_hl and
+         * ip_v.  So, to get ip_hl, we mask off the bottom four bits.
+         */
+        hlen = (ip->ip_vhl & 0x0F) << 2;
 #else
-    hlen = ip->ip_hl << 2;
+        hlen = ip->ip_hl << 2;
 #endif
+    }
 
     if (reply_buf_len < hlen + ICMP_MINLEN) {
         /* too short */
@@ -1874,7 +1956,7 @@ int decode_icmp_ipv4(
 
         sent_icmp = (struct icmp*)(reply_buf + hlen + ICMP_MINLEN + sizeof(struct ip));
 
-        if (sent_icmp->icmp_type != ICMP_ECHO || ntohs(sent_icmp->icmp_id) != ident) {
+        if (sent_icmp->icmp_type != ICMP_ECHO || sent_icmp->icmp_id != ident4) {
             /* not caused by us */
             return 0;
         }
@@ -1923,7 +2005,7 @@ int decode_icmp_ipv4(
         return 0;
     }
 
-    *id = ntohs(icp->icmp_id);
+    *id = icp->icmp_id;
     *seq = ntohs(icp->icmp_seq);
 
     return 1;
@@ -1966,7 +2048,7 @@ int decode_icmp_ipv6(
 
         sent_icmp = (struct icmp6_hdr*)(reply_buf + sizeof(struct icmp6_hdr) + sizeof(struct ip));
 
-        if (sent_icmp->icmp6_type != ICMP_ECHO || ntohs(sent_icmp->icmp6_id) != ident) {
+        if (sent_icmp->icmp6_type != ICMP_ECHO || sent_icmp->icmp6_id != ident6) {
             /* not caused by us */
             return 0;
         }
@@ -2015,7 +2097,7 @@ int decode_icmp_ipv6(
         return 0;
     }
 
-    *id = ntohs(icp->icmp6_id);
+    *id = icp->icmp6_id;
     *seq = ntohs(icp->icmp6_seq);
 
     return 1;
@@ -2031,8 +2113,8 @@ int wait_for_reply(long wait_time)
     HOST_ENTRY* h;
     long this_reply;
     int this_count;
-    struct timeval* sent_time;
-    struct timeval recv_time;
+    struct timespec* sent_time;
+    struct timespec recv_time = {0};
     SEQMAP_VALUE* seqmap_value;
     unsigned short id;
     unsigned short seq;
@@ -2072,7 +2154,7 @@ int wait_for_reply(long wait_time)
         return 1;
     }
 
-    gettimeofday(&current_time, &tz);
+    clock_gettime(CLOCKID, &current_time);
 
     /* Process ICMP packet and retrieve id/seq */
     if (response_addr.ss_family == AF_INET) {
@@ -2084,6 +2166,13 @@ int wait_for_reply(long wait_time)
                 &id,
                 &seq)) {
             return 1;
+        }
+        if (id != ident4) {
+            return 1; /* packet received, but not the one we are looking for! */
+        }
+        if (using_sock_dgram4) {
+            /* IP header is not included in read SOCK_DGRAM ICMP responses */
+            result += sizeof(struct ip);
         }
     }
 #ifdef IPV6
@@ -2097,14 +2186,13 @@ int wait_for_reply(long wait_time)
                 &seq)) {
             return 1;
         }
+        if (id != ident6) {
+            return 1; /* packet received, but not the one we are looking for! */
+        }
     }
 #endif
     else {
         return 1;
-    }
-
-    if (id != ident) {
-        return 1; /* packet received, but not the one we are looking for! */
     }
 
     seqmap_value = seqmap_fetch(seq, &current_time);
@@ -2118,11 +2206,11 @@ int wait_for_reply(long wait_time)
     h = table[n];
     sent_time = &seqmap_value->ping_ts;
     this_count = seqmap_value->ping_count;
-    this_reply = timeval_diff(&recv_time, sent_time);
+    this_reply = timespec_diff(&recv_time, sent_time);
 
     /* discard reply if delay is larger than timeout
      * (see also: github #32) */
-    if (this_reply > h->timeout) {
+    if (ns_to_tick(this_reply) > h->timeout) {
         return 1;
     }
 
@@ -2155,6 +2243,27 @@ int wait_for_reply(long wait_time)
         sum_replies += this_reply;
         h->total_time += this_reply;
         total_replies++;
+        
+        if (h->num_recv == 1) {
+            num_alive++;
+            if (verbose_flag || alive_flag) {
+                printf("%s", h->host);
+
+                if (verbose_flag)
+                    printf(" is alive");
+
+                if (elapsed_flag)
+                    printf(" (%s ms)", sprint_tm(this_reply));
+
+                if (addr_cmp((struct sockaddr*)&response_addr, (struct sockaddr*)&h->saddr)) {
+                    char buf[INET6_ADDRSTRLEN];
+                    getnameinfo((struct sockaddr*)&response_addr, sizeof(response_addr), buf, INET6_ADDRSTRLEN, NULL, 0, NI_NUMERICHOST);
+                    fprintf(stderr, " [<- %s]", buf);
+                }
+
+                printf("\n");
+            }
+        }
     }
 
     /* received ping is cool, so process it */
@@ -2191,6 +2300,7 @@ int wait_for_reply(long wait_time)
         }
     }
 
+
     /* Mark as received in window */
     h->window[this_count % h->window_size] = INT_MIN;
 
@@ -2215,11 +2325,12 @@ int wait_for_reply(long wait_time)
         }
     }
 
+
     if (per_recv_flag) {
         if (timestamp_flag) {
-            printf("[%lu.%06lu] ",
+            printf("[%lu.%09lu] ",
                 (unsigned long)recv_time.tv_sec,
-                (unsigned long)recv_time.tv_usec);
+                (unsigned long)recv_time.tv_nsec);
         }
         avg = h->total_time / h->num_recv;
         printf("%s%s : [%d], %d bytes, %s ms",
@@ -2276,7 +2387,6 @@ int wait_for_reply(long wait_time)
         remove_job(h);
     }
 
-    fflush(stdout);
     return num_jobs;
 }
 
@@ -2305,8 +2415,8 @@ void add_name(char* name)
     char addrbuf[256];
 
     /* getaddrinfo */
-    bzero(&hints, sizeof(struct addrinfo));
-    hints.ai_flags = 0;
+    memset(&hints, 0, sizeof(struct addrinfo));
+    hints.ai_flags = AI_UNUSABLE;
     hints.ai_socktype = SOCK_RAW;
     hints.ai_family = hints_ai_family;
     if (hints_ai_family == AF_INET) {
@@ -2372,7 +2482,7 @@ void add_name(char* name)
             }
 
             if (name_flag || rdns_flag) {
-                char nameaddrbuf[512];
+                char nameaddrbuf[512+3];
                 snprintf(nameaddrbuf, sizeof(nameaddrbuf) / sizeof(char), "%s (%s)", printname, addrbuf);
                 add_addr(name, nameaddrbuf, res->ai_addr, res->ai_addrlen);
             }
@@ -2408,7 +2518,8 @@ void add_name(char* name)
 void add_addr(char* name, char* host, struct sockaddr* ipaddr, socklen_t ipaddr_len)
 {
     HOST_ENTRY* p;
-    int n, *i;
+    int n;
+    int64_t *i;
 
     p = (HOST_ENTRY*)malloc(sizeof(HOST_ENTRY));
     if (!p)
@@ -2442,7 +2553,7 @@ void add_addr(char* name, char* host, struct sockaddr* ipaddr, socklen_t ipaddr_
 
     /* array for response time results */
     if (!loop_flag) {
-        i = (int*)malloc(trials * sizeof(int));
+        i = (int64_t*)malloc(trials * sizeof(int64_t));
         if (!i)
             crash_and_burn("can't allocate resp_times array");
 
@@ -2464,7 +2575,7 @@ void add_addr(char* name, char* host, struct sockaddr* ipaddr, socklen_t ipaddr_
 #if defined(DEBUG) || defined(_DEBUG)
     /* likewise for sent times */
     if (sent_times_flag) {
-        i = (int*)malloc(trials * sizeof(int));
+        i = (int64_t*)malloc(trials * sizeof(int64_t));
         if (!i)
             crash_and_burn("can't allocate sent_times array");
 
@@ -2478,7 +2589,7 @@ void add_addr(char* name, char* host, struct sockaddr* ipaddr, socklen_t ipaddr_
     /* schedule first ping */
     p->ev_type = EV_TYPE_PING;
     p->ev_time.tv_sec = 0;
-    p->ev_time.tv_usec = 0;
+    p->ev_time.tv_nsec = 0;
     ev_enqueue(p);
 
     num_hosts++;
@@ -2568,46 +2679,55 @@ void print_warning(char* format, ...)
 
 /************************************************************
 
-  Function: timeval_diff
+  Function: timespec_diff
 
 *************************************************************
 
-  Inputs:  struct timeval *a, struct timeval *b
+  Inputs:  struct timespec *a, struct timespec *b
 
-  Returns:  long
+  Returns: int64_t
 
   Description:
 
-  timeval_diff now returns result in hundredths of milliseconds
-  ie, tens of microseconds
+  timespec_diff now returns result in nanoseconds
 
 ************************************************************/
 
-long timeval_diff(struct timeval* a, struct timeval* b)
+int64_t timespec_ns(struct timespec* a)
 {
-    long sec_diff = a->tv_sec - b->tv_sec;
-    if (sec_diff == 0) {
-        return (a->tv_usec - b->tv_usec) / 10;
-    }
-    else if (sec_diff < 100) {
-        return (sec_diff * 1000000 + a->tv_usec - b->tv_usec) / 10;
-    }
-    else {
-        /* For such large differences, we don't really care about the microseconds... */
-        return sec_diff * 100000;
-    }
+    return (a->tv_sec * 1000000000LL) + a->tv_nsec;
+}
+int64_t timespec_10us(struct timespec* a)
+{
+    return (a->tv_sec * 100000) + a->tv_nsec / 10000;
+}
+void timespec_from_ns(struct timespec* a, uint64_t ns)
+{
+    a->tv_sec = ns / 1000000000ULL;
+    a->tv_nsec = ns % 1000000000ULL;
+}
+
+int64_t timespec_diff(struct timespec* a, struct timespec* b)
+{
+    return timespec_ns(a) - timespec_ns(b);
+}
+long timespec_diff_10us(struct timespec* a, struct timespec* b)
+{
+    return (long)(timespec_10us(a) - timespec_10us(b));
 }
 
 /************************************************************
 
-  Function: timeval_add
+  Function: timespec_add
 
 *************************************************************/
-void timeval_add(struct timeval* a, long t_10u)
+void timespec_add_10us(struct timespec* a, long t_10u)
 {
-    t_10u *= 10;
-    a->tv_sec += (t_10u + a->tv_usec) / 1000000;
-    a->tv_usec = (t_10u + a->tv_usec) % 1000000;
+    uint64_t ns = t_10u;
+    ns *= 10; // tick -> us
+    ns *= 1000; // us -> ns
+    a->tv_sec += (ns + a->tv_nsec) / 1000000000ULL;
+    a->tv_nsec = (ns + a->tv_nsec) % 1000000000ULL;
 }
 
 /************************************************************
@@ -2627,32 +2747,33 @@ void timeval_add(struct timeval* a, long t_10u)
 
 ************************************************************/
 
-char* sprint_tm(int t)
+const char* sprint_tm(int64_t ns)
 {
     static char buf[10];
+    double t = (double)ns / 1e6;
 
-    if (t < 0) {
+    if (t < 0.0) {
         /* negative (unexpected) */
-        sprintf(buf, "%.2g", (double)t / 100);
+        sprintf(buf, "%.2g", (double)t / 1e9);
     }
-    else if (t < 100) {
+    else if (t < 1.0) {
         /* <= 0.99 ms */
-        sprintf(buf, "0.%02d", t);
+        sprintf(buf, "%.6f", t);
     }
-    else if (t < 1000) {
+    else if (t < 10.0) {
         /* 1.00 - 9.99 ms */
-        sprintf(buf, "%d.%02d", t / 100, t % 100);
+        sprintf(buf, "%.2f", t);
     }
-    else if (t < 10000) {
+    else if (t < 100.0) {
         /* 10.0 - 99.9 ms */
-        sprintf(buf, "%d.%d", t / 100, (t % 100) / 10);
+        sprintf(buf, "%.1f", t);
     }
-    else if (t < 100000000) {
+    else if (t < 1000000.0) {
         /* 100 - 1'000'000 ms */
-        sprintf(buf, "%d", t / 100);
+        sprintf(buf, "%d", (int)t);
     }
     else {
-        sprintf(buf, "%.2e", (double)(t / 100));
+        sprintf(buf, "%.2e", t);
     }
 
     return (buf);
@@ -2704,8 +2825,8 @@ void ev_enqueue(HOST_ENTRY* h)
 
 #if defined(DEBUG) || defined(_DEBUG)
     if (trace_flag) {
-        long st = timeval_diff(&h->ev_time, &current_time);
-        fprintf(stderr, "Enqueue: host=%s, when=%d ms (%d, %d)\n", h->host, st / 100, h->ev_time.tv_sec, h->ev_time.tv_usec);
+        long st = timespec_diff_10us(&h->ev_time, &current_time);
+        fprintf(stderr, "Enqueue: host=%s, when=%ld ms (%ld, %ld)\n", h->host, st / 100, h->ev_time.tv_sec, h->ev_time.tv_nsec);
     }
 #endif
 
@@ -2719,7 +2840,7 @@ void ev_enqueue(HOST_ENTRY* h)
     }
 
     /* Insert on tail? */
-    if (h->ev_time.tv_sec > ev_last->ev_time.tv_sec || (h->ev_time.tv_sec == ev_last->ev_time.tv_sec && h->ev_time.tv_usec >= ev_last->ev_time.tv_usec)) {
+    if (timespec_diff(&h->ev_time, &ev_last->ev_time) >= 0) {
         h->ev_next = NULL;
         h->ev_prev = ev_last;
         ev_last->ev_next = h;
@@ -2731,7 +2852,7 @@ void ev_enqueue(HOST_ENTRY* h)
     i = ev_last;
     while (1) {
         i_prev = i->ev_prev;
-        if (i_prev == NULL || h->ev_time.tv_sec > i_prev->ev_time.tv_sec || (h->ev_time.tv_sec == i_prev->ev_time.tv_sec && h->ev_time.tv_usec >= i_prev->ev_time.tv_usec)) {
+        if (i_prev == NULL || timespec_diff(&h->ev_time, &i_prev->ev_time) >= 0) {
             h->ev_prev = i_prev;
             h->ev_next = i;
             i->ev_prev = h;
