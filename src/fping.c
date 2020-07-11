@@ -46,6 +46,7 @@ extern "C" {
 #include <stdio.h>
 #include <stdint.h>
 #include <time.h>
+#include <limits.h>
 
 #include "seqmap.h"
 
@@ -240,6 +241,10 @@ typedef struct host_entry {
     int min_reply_i; /* shortest response time */
     int total_time_i; /* sum of response times */
     int discard_next_recv_i; /* don't count next received reply for split reporting */
+
+    int* window; /* circular buffer of per-sent-ping timestamps for pings within their timeouts */
+    int window_size; /* size of above; needs to be larger than ceil(timeout / period) */
+
     int64_t* resp_times; /* individual response times */
 #if defined(DEBUG) || defined(_DEBUG)
     int64_t* sent_times; /* per-sent-ping timestamp */
@@ -1778,6 +1783,9 @@ int send_ping(HOST_ENTRY* h)
         if (!loop_flag)
             h->resp_times[h->num_sent] = RESP_WAITING;
 
+        /* mark this trial outstanding in the window */
+        h->window[h->num_sent % h->window_size] = timeval_diff(&h->last_send_time, &start_time);;
+
 #if defined(DEBUG) || defined(_DEBUG)
         if (sent_times_flag)
             h->sent_times[h->num_sent] = timespec_diff(&h->last_send_time, &start_time);
@@ -2292,6 +2300,32 @@ int wait_for_reply(long wait_time)
         }
     }
 
+
+    /* Mark as received in window */
+    h->window[this_count % h->window_size] = INT_MIN;
+
+    if (h->num_recv == 1) {
+        num_alive++;
+        if (verbose_flag || alive_flag) {
+            printf("%s", h->host);
+
+            if (verbose_flag)
+                printf(" is alive");
+
+            if (elapsed_flag)
+                printf(" (%s ms)", sprint_tm(this_reply));
+
+            if (addr_cmp((struct sockaddr*)&response_addr, (struct sockaddr*)&h->saddr)) {
+                char buf[INET6_ADDRSTRLEN];
+                getnameinfo((struct sockaddr*)&response_addr, sizeof(response_addr), buf, INET6_ADDRSTRLEN, NULL, 0, NI_NUMERICHOST);
+                fprintf(stderr, " [<- %s]", buf);
+            }
+
+            printf("\n");
+        }
+    }
+
+
     if (per_recv_flag) {
         if (timestamp_flag) {
             printf("[%lu.%09lu] ",
@@ -2303,9 +2337,36 @@ int wait_for_reply(long wait_time)
             h->host, h->pad, this_count, result, sprint_tm(this_reply));
         printf(" (%s avg, ", sprint_tm(avg));
 
-        if (h->num_recv <= h->num_sent) {
+        /* Calculate the expected number of packets */
+        long now = timeval_diff(&recv_time, &start_time);
+        int expected = h->num_sent;
+        for (int j = 0; j < h->window_size; j++) {
+            int v = h->window[j];
+            if ( v >= 0 && h->window[j] + h->timeout > now ){
+               /* This entry has not been received yet */
+               /* And it is still within it's timeout, do not count it*/
+               expected--;
+            }
+#if 0
+            if ( v == INT_MIN ){
+                fprintf(stderr, " ");
+            }
+            else {
+                if (h->window[j] + h->timeout > now ){
+                    fprintf(stderr, ".");
+                }
+                else {
+                    fprintf(stderr, "x");
+                }
+            }
+#endif
+        }
+        if ( expected < 1 )
+                expected = 1;
+
+        if (h->num_recv <= expected) {
             printf("%d%% loss)",
-                ((h->num_sent - h->num_recv) * 100) / h->num_sent);
+                ((expected - h->num_recv) * 100) / expected);
         }
         else {
             printf("%d%% return)",
@@ -2474,6 +2535,10 @@ void add_addr(char* name, char* host, struct sockaddr* ipaddr, socklen_t ipaddr_
     p->running = 1;
     p->min_reply = 0;
 
+    p->window_size = 2 * timeout / perhost_interval;
+    if ( p->window_size <= 0 )
+        p->window_size = 1;
+
     if (netdata_flag) {
         char* s = p->name;
         while (*s) {
@@ -2497,6 +2562,15 @@ void add_addr(char* name, char* host, struct sockaddr* ipaddr, socklen_t ipaddr_
 
         p->resp_times = i;
     }
+
+    /* Array for in-flight packet window */
+    i = (int*)malloc(p->window_size * sizeof(int));
+    if (!i)
+         crash_and_burn("can't allocate window array");
+    for (n = 1; n < p->window_size; n++)
+        i[n] = INT_MIN;
+
+    p->window = i;
 
 #if defined(DEBUG) || defined(_DEBUG)
     /* likewise for sent times */
